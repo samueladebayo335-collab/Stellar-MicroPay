@@ -5,6 +5,7 @@
  * All formatters respect user locale, timezone, and accessibility requirements.
  * 
  * These replace hard-coded toFixed(), English-only date strings, and provider-dependent formatting.
+ * Usage guide: docs/intl-formatting.md
  */
 
 // ─── Locale Management ──────────────────────────────────────────────────────
@@ -23,12 +24,49 @@ export function getUserLocale(): string {
 /**
  * Get the user's timezone from browser API or fallback to 'UTC'.
  */
+let cachedTimezone: string | null = null;
 export function getUserTimezone(): string {
+  if (cachedTimezone !== null) return cachedTimezone;
   try {
-    return Intl.DateTimeFormat().resolvedOptions().timeZone;
+    cachedTimezone = Intl.DateTimeFormat().resolvedOptions().timeZone;
   } catch {
-    return 'UTC';
+    cachedTimezone = 'UTC';
   }
+  return cachedTimezone;
+}
+
+// ─── Formatter Cache ────────────────────────────────────────────────────────
+//
+// Constructing an Intl formatter is comparatively expensive; the same handful
+// of option combinations are reused across renders, so memoize them.
+
+const numberFormatCache = new Map<string, Intl.NumberFormat>();
+const dateTimeFormatCache = new Map<string, Intl.DateTimeFormat>();
+
+function getCachedNumberFormat(
+  locale: string,
+  options: Intl.NumberFormatOptions
+): Intl.NumberFormat {
+  const key = `${locale}|${JSON.stringify(options)}`;
+  let formatter = numberFormatCache.get(key);
+  if (!formatter) {
+    formatter = new Intl.NumberFormat(locale, options);
+    numberFormatCache.set(key, formatter);
+  }
+  return formatter;
+}
+
+function getCachedDateTimeFormat(
+  locale: string,
+  options: Intl.DateTimeFormatOptions
+): Intl.DateTimeFormat {
+  const key = `${locale}|${JSON.stringify(options)}`;
+  let formatter = dateTimeFormatCache.get(key);
+  if (!formatter) {
+    formatter = new Intl.DateTimeFormat(locale, options);
+    dateTimeFormatCache.set(key, formatter);
+  }
+  return formatter;
 }
 
 // ─── Number Formatters ──────────────────────────────────────────────────────
@@ -37,6 +75,10 @@ export interface AssetFormatOptions {
   locale?: string;
   preserveTrailingZeros?: boolean;
   useGrouping?: boolean;
+  /** Override the asset's minimum fraction digits (e.g. force 2 decimals). */
+  minimumFractionDigits?: number;
+  /** Override the asset's maximum fraction digits. */
+  maximumFractionDigits?: number;
 }
 
 export interface AssetFormatRule {
@@ -51,7 +93,7 @@ const ASSET_FORMAT_RULES: Record<string, AssetFormatRule> = {
     maximumFractionDigits: 7,
   },
   USDC: {
-    minimumFractionDigits: 2,
+    minimumFractionDigits: 0,
     maximumFractionDigits: 6, // Support very small USDC amounts
   },
   AQUA: {
@@ -105,9 +147,19 @@ export function formatNumber(
     return formatNumber(0, assetCode, options);
   }
 
-  const formatter = new Intl.NumberFormat(locale, {
-    minimumFractionDigits: options.preserveTrailingZeros ? rule.maximumFractionDigits : rule.minimumFractionDigits,
-    maximumFractionDigits: rule.maximumFractionDigits,
+  const maximumFractionDigits =
+    options.maximumFractionDigits ?? rule.maximumFractionDigits;
+  const minimumFractionDigits = Math.min(
+    options.minimumFractionDigits ??
+      (options.preserveTrailingZeros
+        ? rule.maximumFractionDigits
+        : rule.minimumFractionDigits),
+    maximumFractionDigits
+  );
+
+  const formatter = getCachedNumberFormat(locale, {
+    minimumFractionDigits,
+    maximumFractionDigits,
     useGrouping: options.useGrouping ?? true,
   });
 
@@ -185,7 +237,6 @@ export function formatSmallAmount(
   assetCode = DEFAULT_ASSET_CODE,
   options: AssetFormatOptions = {}
 ): string {
-  const locale = options.locale ?? getUserLocale();
   const normalized = normalizeAssetCode(assetCode);
   const num = typeof amount === 'string' ? parseFloat(amount) : amount;
 
@@ -193,14 +244,29 @@ export function formatSmallAmount(
     return formatAsset(0, normalized, options);
   }
 
-  // For very small amounts, use scientific notation
+  // For very small amounts, use scientific notation with a localized
+  // multiplication sign and superscript exponent.
   if (Math.abs(num) < 0.0001) {
-    const formatter = new Intl.NumberFormat(locale, {
-      notation: 'scientific',
-      minimumFractionDigits: 2,
-      maximumFractionDigits: 2,
-    });
-    return `~${formatter.format(num)} ${normalized}`;
+    const exponent = Math.floor(Math.log10(Math.abs(num)));
+    const mantissa = num / Math.pow(10, exponent);
+    const superscriptDigits: Record<string, string> = {
+      "0": "\u2070",
+      "1": "\u00b9",
+      "2": "\u00b2",
+      "3": "\u00b3",
+      "4": "\u2074",
+      "5": "\u2075",
+      "6": "\u2076",
+      "7": "\u2077",
+      "8": "\u2078",
+      "9": "\u2079",
+      "-": "\u207b",
+    };
+    const exponentText = String(exponent)
+      .split("")
+      .map((char) => superscriptDigits[char] ?? char)
+      .join("");
+    return `~${mantissa.toFixed(2)} \u00d7 10${exponentText} ${normalized}`;
   }
 
   return formatAsset(amount, normalized, options);
@@ -263,7 +329,7 @@ export function formatUSD(
     return formatUSD(0, options);
   }
 
-  const formatter = new Intl.NumberFormat(locale, {
+  const formatter = getCachedNumberFormat(locale, {
     style: 'currency',
     currency: 'USD',
     minimumFractionDigits: 2,
@@ -272,6 +338,33 @@ export function formatUSD(
 
   const formatted = formatter.format(amount);
   return showApprox ? `≈ ${formatted}` : formatted;
+}
+
+/**
+ * Format a percentage from percentage points (not a 0–1 fraction).
+ *
+ * @example
+ * formatPercent(12.345) // => "12.35%" (en-US)
+ * formatPercent(0.5)   // => "0.5%"
+ */
+export function formatPercent(
+  value: number,
+  options: {
+    locale?: string;
+    minimumFractionDigits?: number;
+    maximumFractionDigits?: number;
+  } = {}
+): string {
+  const locale = options.locale ?? getUserLocale();
+  const num = Number.isFinite(value) ? value : 0;
+
+  const formatter = getCachedNumberFormat(locale, {
+    style: 'percent',
+    minimumFractionDigits: options.minimumFractionDigits ?? 0,
+    maximumFractionDigits: options.maximumFractionDigits ?? 2,
+  });
+
+  return formatter.format(num / 100);
 }
 
 // ─── Date & Time Formatters ────────────────────────────────────────────────
@@ -306,7 +399,7 @@ export function formatDate(
       return String(date);
     }
 
-    const formatter = new Intl.DateTimeFormat(locale, {
+    const formatter = getCachedDateTimeFormat(locale, {
       year: 'numeric',
       month: 'short',
       day: 'numeric',
@@ -329,6 +422,159 @@ export function formatDate(
  * formatDateFull('2024-01-15T10:30:45Z')
  * // => "January 15, 2024 at 10:30:45 AM PST"
  */
+/** Format a calendar date without the time, e.g. "Jan 15, 2024". */
+export function formatDateOnly(
+  date: string | Date | number,
+  options: DateFormatOptions = {}
+): string {
+  try {
+    const locale = options.locale ?? getUserLocale();
+    const timezone = options.timezone ?? getUserTimezone();
+    const dateObj = typeof date === 'string' || typeof date === 'number' ? new Date(date) : date;
+
+    if (!dateObj || isNaN(dateObj.getTime())) {
+      return String(date);
+    }
+
+    return getCachedDateTimeFormat(locale, {
+      year: 'numeric',
+      month: 'short',
+      day: 'numeric',
+      timeZone: timezone,
+    }).format(dateObj);
+  } catch (err) {
+    console.error('Invalid date:', date, err);
+    return String(date);
+  }
+}
+
+/** Format a short month/day label, e.g. "Jan 15" for chart axes. */
+export function formatDateShort(
+  date: string | Date | number,
+  options: DateFormatOptions = {}
+): string {
+  try {
+    const locale = options.locale ?? getUserLocale();
+    const timezone = options.timezone ?? getUserTimezone();
+    const dateObj = typeof date === 'string' || typeof date === 'number' ? new Date(date) : date;
+
+    if (!dateObj || isNaN(dateObj.getTime())) {
+      return String(date);
+    }
+
+    return getCachedDateTimeFormat(locale, {
+      month: 'short',
+      day: 'numeric',
+      timeZone: timezone,
+    }).format(dateObj);
+  } catch (err) {
+    console.error('Invalid date:', date, err);
+    return String(date);
+  }
+}
+
+/** Format a short month/day plus time, e.g. "Jan 15, 10:30 AM". */
+export function formatDateTimeShort(
+  date: string | Date | number,
+  options: DateFormatOptions = {}
+): string {
+  try {
+    const locale = options.locale ?? getUserLocale();
+    const timezone = options.timezone ?? getUserTimezone();
+    const dateObj = typeof date === 'string' || typeof date === 'number' ? new Date(date) : date;
+
+    if (!dateObj || isNaN(dateObj.getTime())) {
+      return String(date);
+    }
+
+    return getCachedDateTimeFormat(locale, {
+      month: 'short',
+      day: 'numeric',
+      hour: '2-digit',
+      minute: '2-digit',
+      timeZone: timezone,
+    }).format(dateObj);
+  } catch (err) {
+    console.error('Invalid date:', date, err);
+    return String(date);
+  }
+}
+
+/** Format a localized time, e.g. "10:30 AM" or "10:30". */
+export function formatTime(
+  date: string | Date | number,
+  options: DateFormatOptions & { seconds?: boolean } = {}
+): string {
+  try {
+    const locale = options.locale ?? getUserLocale();
+    const timezone = options.timezone ?? getUserTimezone();
+    const dateObj = typeof date === 'string' || typeof date === 'number' ? new Date(date) : date;
+
+    if (!dateObj || isNaN(dateObj.getTime())) {
+      return String(date);
+    }
+
+    return getCachedDateTimeFormat(locale, {
+      hour: '2-digit',
+      minute: '2-digit',
+      ...(options.seconds ? { second: '2-digit' } : {}),
+      timeZone: timezone,
+    }).format(dateObj);
+  } catch (err) {
+    console.error('Invalid date:', date, err);
+    return String(date);
+  }
+}
+
+/** Format a month name, e.g. "Jan" (short) or "January" (long). */
+export function formatMonth(
+  date: string | Date | number,
+  options: DateFormatOptions & { style?: 'short' | 'long' } = {}
+): string {
+  try {
+    const locale = options.locale ?? getUserLocale();
+    const timezone = options.timezone ?? getUserTimezone();
+    const dateObj = typeof date === 'string' || typeof date === 'number' ? new Date(date) : date;
+
+    if (!dateObj || isNaN(dateObj.getTime())) {
+      return String(date);
+    }
+
+    return getCachedDateTimeFormat(locale, {
+      month: options.style ?? 'short',
+      timeZone: timezone,
+    }).format(dateObj);
+  } catch (err) {
+    console.error('Invalid date:', date, err);
+    return String(date);
+  }
+}
+
+/** Format a month and year, e.g. "January 2024". */
+export function formatMonthYear(
+  date: string | Date | number,
+  options: DateFormatOptions = {}
+): string {
+  try {
+    const locale = options.locale ?? getUserLocale();
+    const timezone = options.timezone ?? getUserTimezone();
+    const dateObj = typeof date === 'string' || typeof date === 'number' ? new Date(date) : date;
+
+    if (!dateObj || isNaN(dateObj.getTime())) {
+      return String(date);
+    }
+
+    return getCachedDateTimeFormat(locale, {
+      month: 'long',
+      year: 'numeric',
+      timeZone: timezone,
+    }).format(dateObj);
+  } catch (err) {
+    console.error('Invalid date:', date, err);
+    return String(date);
+  }
+}
+
 export function formatDateFull(
   date: string | Date | number,
   options: DateFormatOptions = {}
@@ -342,7 +588,7 @@ export function formatDateFull(
       return String(date);
     }
 
-    const formatter = new Intl.DateTimeFormat(locale, {
+    const formatter = getCachedDateTimeFormat(locale, {
       year: 'numeric',
       month: 'long',
       day: 'numeric',
@@ -457,6 +703,11 @@ export function pluralize(
   options: { locale?: string } = {}
 ): string {
   const locale = options.locale ?? getUserLocale();
+
+  if (count === 0 && forms.zero) {
+    return forms.zero;
+  }
+
   const pr = new Intl.PluralRules(locale);
   const rule = pr.select(count);
 
